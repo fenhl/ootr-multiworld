@@ -45,7 +45,7 @@ enum SessionError {
     Write(async_proto::WriteError),
 }
 
-async fn client_session(rooms: Arc<RwLock<HashMap<String, Arc<RwLock<Room>>>>>, socket_id: multiworld::SocketId, mut reader: OwnedReadHalf, writer: Arc<Mutex<OwnedWriteHalf>>) -> Result<(), SessionError> {
+async fn client_session(rooms: Arc<RwLock<HashMap<String, Arc<RwLock<Room>>>>>, socket: TcpStream) -> Result<(), SessionError> {
     macro_rules! error {
         ($($msg:tt)*) => {{
             let msg = format!($($msg)*);
@@ -54,6 +54,7 @@ async fn client_session(rooms: Arc<RwLock<HashMap<String, Arc<RwLock<Room>>>>>, 
         }};
     }
 
+    let socket_id = multiworld::socket_id(&socket);
     multiworld::VERSION.write(&mut *writer.lock().await).await?;
     let client_version = u8::read(&mut reader).await?;
     if client_version != multiworld::VERSION { return Err::<(), _>(SessionError::VersionMismatch(client_version)) }
@@ -67,53 +68,62 @@ async fn client_session(rooms: Arc<RwLock<HashMap<String, Arc<RwLock<Room>>>>>, 
         }
     }
     //TODO keep room list up to date
-    let room = match LobbyClientMessage::read(&mut reader).await? {
-        LobbyClientMessage::JoinRoom { name, password } => if let Some(room) = rooms.read().await.get(&name) {
-            if room.read().await.password != password { error!("wrong password for room {:?}", name) }
-            if room.read().await.clients.len() >= u8::MAX.into() { error!("room {:?} is full", name) }
-            {
-                let mut room = room.write().await;
-                room.add_client(socket_id, Arc::clone(&writer)).await;
-                let mut players = Vec::<Player>::default();
-                let mut num_unassigned_clients = 0;
-                for &(player, _) in room.clients.values() {
-                    if let Some(player) = player {
-                        players.insert(players.binary_search_by_key(&player.world, |p| p.world).expect_err("duplicate world number"), player);
-                    } else {
-                        num_unassigned_clients += 1;
+    let (reader, writer, room) = loop {
+        match LobbyClientMessage::read(&mut reader).await? {
+            LobbyClientMessage::JoinRoom { name, password } => if let Some(room) = rooms.read().await.get(&name) {
+                let (reader, writer) = socket.into_split();
+                let writer = Arc::new(Mutex::new(writer));
+                if room.read().await.password != password { error!("wrong password for room {:?}", name) }
+                if room.read().await.clients.len() >= u8::MAX.into() { error!("room {:?} is full", name) }
+                {
+                    let mut room = room.write().await;
+                    room.add_client(socket_id, Arc::clone(&writer)).await;
+                    let mut players = Vec::<Player>::default();
+                    let mut num_unassigned_clients = 0;
+                    for &(player, _) in room.clients.values() {
+                        if let Some(player) = player {
+                            players.insert(players.binary_search_by_key(&player.world, |p| p.world).expect_err("duplicate world number"), player);
+                        } else {
+                            num_unassigned_clients += 1;
+                        }
+                    }
+                    ServerMessage::EnterRoom { players, num_unassigned_clients }.write(&mut *writer.lock().await).await?;
+                }
+                break (reader, writer, Arc::clone(room))
+            } else {
+                error!("there is no room named {:?}", name)
+            },
+            LobbyClientMessage::CreateRoom { name, password } => {
+                let (reader, writer) = socket.into_split();
+                let writer = Arc::new(Mutex::new(writer));
+                //TODO disallow creating new rooms if preparing for reboot? (or at least warn)
+                if name.is_empty() { error!("room name must not be empty") }
+                if name.chars().count() >= 64 { error!("room name too long (maximum 64 characters)") }
+                if name.contains('\0') { error!("room name must not contain null characters") }
+                if password.chars().count() >= 64 { error!("room password too long (maximum 64 characters)") }
+                if password.contains('\0') { error!("room password must not contain null characters") }
+                match rooms.write().await.entry(name) {
+                    hash_map::Entry::Occupied(_) => error!("a room with this name already exists"),
+                    hash_map::Entry::Vacant(entry) => {
+                        let mut clients = HashMap::default();
+                        clients.insert(socket_id, (None, Arc::clone(&writer)));
+                        let room = Arc::new(RwLock::new(Room {
+                            password, clients,
+                            base_queue: Vec::default(),
+                            player_queues: HashMap::default(),
+                        }));
+                        entry.insert(Arc::clone(&room));
+                        //TODO automatically delete rooms after 7 days of inactivity (reduce to 24 hours after backup system is implemented, to reduce room list clutter)
+                        ServerMessage::EnterRoom {
+                            players: Vec::default(),
+                            num_unassigned_clients: 1,
+                        }.write(&mut *writer.lock().await).await?;
+                        break (reader, writer, room)
                     }
                 }
-                ServerMessage::EnterRoom { players, num_unassigned_clients }.write(&mut *writer.lock().await).await?;
             }
-            Arc::clone(room)
-        } else {
-            error!("there is no room named {:?}", name)
-        },
-        LobbyClientMessage::CreateRoom { name, password } => {
-            //TODO disallow creating new rooms if preparing for reboot? (or at least warn)
-            if name.is_empty() { error!("room name must not be empty") }
-            if name.chars().count() >= 64 { error!("room name too long (maximum 64 characters)") }
-            if name.contains('\0') { error!("room name must not contain null characters") }
-            if password.chars().count() >= 64 { error!("room password too long (maximum 64 characters)") }
-            if password.contains('\0') { error!("room password must not contain null characters") }
-            match rooms.write().await.entry(name) {
-                hash_map::Entry::Occupied(_) => error!("a room with this name already exists"),
-                hash_map::Entry::Vacant(entry) => {
-                    let mut clients = HashMap::default();
-                    clients.insert(socket_id, (None, Arc::clone(&writer)));
-                    let room = Arc::new(RwLock::new(Room {
-                        password, clients,
-                        base_queue: Vec::default(),
-                        player_queues: HashMap::default(),
-                    }));
-                    entry.insert(Arc::clone(&room));
-                    //TODO automatically delete rooms after 7 days of inactivity (reduce to 24 hours after backup system is implemented, to reduce room list clutter)
-                    ServerMessage::EnterRoom {
-                        players: Vec::default(),
-                        num_unassigned_clients: 1,
-                    }.write(&mut *writer.lock().await).await?;
-                    room
-                }
+            LobbyClientMessage::Encrypt => {
+                unimplemented!() //TODO enable TLS
             }
         }
     };
@@ -139,12 +149,9 @@ async fn main() -> io::Result<Never> {
     let listener = TcpListener::bind((Ipv6Addr::UNSPECIFIED, multiworld::PORT)).await?;
     loop {
         let (socket, _) = listener.accept().await?;
-        let socket_id = multiworld::socket_id(&socket);
-        let (reader, writer) = socket.into_split();
-        let writer = Arc::new(Mutex::new(writer));
         let rooms = Arc::clone(&rooms);
         tokio::spawn(async move {
-            if let Err(e) = client_session(Arc::clone(&rooms), socket_id, reader, writer).await {
+            if let Err(e) = client_session(Arc::clone(&rooms), socket).await {
                 eprintln!("{} error in client session: {:?}", Utc::now().format("%Y-%m-%d %H:%M:%S"), e);
             }
             for room in rooms.write().await.values_mut() {

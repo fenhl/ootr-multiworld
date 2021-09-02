@@ -5,17 +5,22 @@ use {
             HashMap,
             HashSet,
         },
+        io,
         mem,
         net::{
             Ipv4Addr,
             Ipv6Addr,
+            SocketAddr,
+            ToSocketAddrs,
         },
         num::NonZeroU8,
         sync::Arc,
+        time::Duration,
     },
     async_proto::Protocol,
     async_recursion::async_recursion,
     chrono::prelude::*,
+    derivative::Derivative,
     derive_more::From,
     tokio::{
         net::tcp::OwnedWriteHalf,
@@ -28,7 +33,7 @@ use {
 pub const ADDRESS_V4: Ipv4Addr = Ipv4Addr::new(37, 252, 122, 84);
 pub const ADDRESS_V6: Ipv6Addr = Ipv6Addr::new(0x2a02, 0x2770, 0x8, 0, 0x21a, 0x4aff, 0xfee1, 0xf281);
 pub const PORT: u16 = 24809;
-pub const VERSION: u8 = 0;
+pub const VERSION: u8 = 1;
 
 const TRIFORCE_PIECE: u16 = 0xca;
 
@@ -198,6 +203,7 @@ pub enum LobbyClientMessage {
         name: String,
         password: String,
     },
+    Encrypt,
 }
 
 #[derive(Protocol)]
@@ -246,14 +252,106 @@ pub enum ServerMessage {
 
 #[derive(Debug, From)]
 pub enum ClientError {
+    Io(io::Error),
     Read(async_proto::ReadError),
     VersionMismatch(u8),
     Write(async_proto::WriteError),
 }
 
-pub fn handshake_sync(tcp_stream: &mut std::net::TcpStream) -> Result<BTreeSet<String>, ClientError> {
-    VERSION.write_sync(tcp_stream)?;
-    let server_version = u8::read_sync(tcp_stream)?;
+pub enum Host {
+    DefaultIpv6,
+    DefaultIpv4,
+    Custom(Vec<SocketAddr>),
+}
+
+pub trait IntoHost {
+    fn into_host(self) -> Result<Host, ClientError>;
+}
+
+impl IntoHost for Host {
+    fn into_host(self) -> Result<Host, ClientError> {
+        Ok(self)
+    }
+}
+
+impl<'a, T: ToSocketAddrs> IntoHost for &'a T {
+    fn into_host(self) -> Result<Host, ClientError> {
+        Ok(Host::Custom(self.to_socket_addrs()?.collect()))
+    }
+}
+
+impl ToSocketAddrs for Host {
+    type Iter = Box<dyn Iterator<Item = SocketAddr>>;
+
+    fn to_socket_addrs(&self) -> io::Result<Self::Iter> {
+        match self {
+            Host::DefaultIpv4 => Ok(Box::new((ADDRESS_V4, PORT).to_socket_addrs()?)),
+            Host::DefaultIpv6 => Ok(Box::new((ADDRESS_V6, PORT).to_socket_addrs()?)),
+            Host::Custom(addrs) => Ok(Box::new(addrs.clone().into_iter())),
+        }
+    }
+}
+
+#[derive(Derivative)]
+#[derivative(Debug)]
+pub enum SyncStream<S: rustls::Session> {
+    Encrypted(#[derivative(Debug = "ignore")] rustls::StreamOwned<S, std::net::TcpStream>),
+    Unencrypted(std::net::TcpStream),
+}
+
+impl<S: rustls::Session> SyncStream<S> {
+    pub fn set_nonblocking(&mut self, nonblocking: bool) -> io::Result<()> {
+        match self {
+            SyncStream::Encrypted(inner) => inner.sock.set_nonblocking(nonblocking),
+            SyncStream::Unencrypted(inner) => inner.set_nonblocking(nonblocking),
+        }
+    }
+}
+
+impl<S: rustls::Session> io::Read for SyncStream<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            SyncStream::Encrypted(inner) => inner.read(buf),
+            SyncStream::Unencrypted(inner) => inner.read(buf),
+        }
+    }
+}
+
+impl<S: rustls::Session> io::Write for SyncStream<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            SyncStream::Encrypted(inner) => inner.write(buf),
+            SyncStream::Unencrypted(inner) => inner.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            SyncStream::Encrypted(inner) => inner.flush(),
+            SyncStream::Unencrypted(inner) => inner.flush(),
+        }
+    }
+}
+
+pub fn connect_sync(host: impl IntoHost) -> Result<(SyncStream<rustls::ClientSession>, BTreeSet<String>), ClientError> {
+    let host = host.into_host()?;
+    let mut tcp_stream = std::net::TcpStream::connect(&host)?;
+    tcp_stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    tcp_stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    VERSION.write_sync(&mut tcp_stream)?;
+    let server_version = u8::read_sync(&mut tcp_stream)?;
     if server_version != VERSION { return Err(ClientError::VersionMismatch(server_version)) }
-    Ok(BTreeSet::read_sync(tcp_stream)?)
+    let mut tcp_stream = if matches!(host, Host::DefaultIpv4 | Host::DefaultIpv6) {
+        LobbyClientMessage::Encrypt.write_sync(&mut tcp_stream)?;
+        let mut config = rustls::ClientConfig::new();
+        config.root_store.add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
+        let config = Arc::new(config);
+        let dns_name = webpki::DNSNameRef::try_from_ascii_str("fenhl.net").expect("invalid DNS name");
+        let client = rustls::ClientSession::new(&config, dns_name);
+        SyncStream::Encrypted(rustls::StreamOwned::new(client, tcp_stream))
+    } else {
+        SyncStream::Unencrypted(tcp_stream)
+    };
+    let rooms = BTreeSet::read_sync(&mut tcp_stream)?;
+    Ok((tcp_stream, rooms))
 }

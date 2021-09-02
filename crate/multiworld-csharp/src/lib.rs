@@ -10,10 +10,8 @@ use {
             CString,
         },
         fmt,
-        net::TcpStream,
         num::NonZeroU8,
         slice,
-        time::Duration,
     },
     async_proto::Protocol,
     itertools::Itertools as _,
@@ -89,13 +87,13 @@ impl<T> DebugResultExt for DebugResult<T> {
 
 #[derive(Debug)]
 pub struct LobbyClient {
-    tcp_stream: TcpStream,
+    tcp_stream: multiworld::SyncStream<rustls::ClientSession>,
     rooms: Vec<String>,
 }
 
 #[derive(Debug)]
 pub struct RoomClient {
-    tcp_stream: TcpStream,
+    tcp_stream: multiworld::SyncStream<rustls::ClientSession>,
     buf: Vec<u8>,
     players: Vec<Player>,
     num_unassigned_clients: u8,
@@ -139,31 +137,15 @@ fn render_filename(name: [u8; 8]) -> String {
 }
 
 #[no_mangle] pub extern "C" fn connect_ipv4() -> HandleOwned<DebugResult<LobbyClient>> {
-    HandleOwned::new(TcpStream::connect((multiworld::ADDRESS_V4, multiworld::PORT))
-        .map_err(DebugError::from)
-        .and_then(|mut tcp_stream| {
-            tcp_stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-            tcp_stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-            let rooms = multiworld::handshake_sync(&mut tcp_stream)?;
-            Ok(LobbyClient {
-                tcp_stream,
-                rooms: rooms.into_iter().collect(),
-            })
-        }))
+    HandleOwned::new(multiworld::connect_sync(multiworld::Host::DefaultIpv4)
+        .map(|(tcp_stream, rooms)| LobbyClient { tcp_stream, rooms: rooms.into_iter().collect() })
+        .map_err(DebugError::from))
 }
 
 #[no_mangle] pub extern "C" fn connect_ipv6() -> HandleOwned<DebugResult<LobbyClient>> {
-    HandleOwned::new(TcpStream::connect((multiworld::ADDRESS_V6, multiworld::PORT))
-        .map_err(DebugError::from)
-        .and_then(|mut tcp_stream| {
-            tcp_stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-            tcp_stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-            let rooms = multiworld::handshake_sync(&mut tcp_stream)?;
-            Ok(LobbyClient {
-                tcp_stream,
-                rooms: rooms.into_iter().collect(),
-            })
-        }))
+    HandleOwned::new(multiworld::connect_sync(multiworld::Host::DefaultIpv6)
+        .map(|(tcp_stream, rooms)| LobbyClient { tcp_stream, rooms: rooms.into_iter().collect() })
+        .map_err(DebugError::from))
 }
 
 /// # Safety

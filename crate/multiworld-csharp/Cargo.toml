@@ -8,8 +8,10 @@ name = "multiworld"
 crate-type = ["cdylib"]
 
 [dependencies]
+derivative = "2"
 itertools = "0.10"
 libc = "0.2"
+rustls = "0.19"
 
 [dependencies.async-proto]
 version = "0.8.2"
